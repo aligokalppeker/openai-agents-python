@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Any
 
 import websockets
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -21,12 +22,22 @@ from agents.realtime.items import (
 from agents.realtime.model_inputs import RealtimeModelSendRawMessage
 from agents.realtime.openai_realtime import OpenAIRealtimeSIPModel
 from agents.realtime.runner import RealtimeRunner
+from agents.realtime import RealtimeRawModelEvent
+from agents.realtime.model_events import RealtimeModelRawServerEvent
 
 from .agents import WELCOME_MESSAGE, get_starting_agent
 
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger("twilio_sip_example")
+
+
+# ---------------------------------------------------------------------------
+# Configuration for consent/disclosure and greeting messages
+# Set CONSENT_MESSAGE to None or empty string to skip consent and go directly to greeting
+# ---------------------------------------------------------------------------
+CONSENT_MESSAGE: str | None = os.getenv("CONSENT_MESSAGE", None)
+GREETING_MESSAGE: str = os.getenv("GREETING_MESSAGE", WELCOME_MESSAGE)
 
 
 def _get_env(name: str) -> str:
@@ -48,6 +59,144 @@ app = FastAPI()
 
 # Track background tasks so repeated webhooks do not spawn duplicates.
 active_call_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+DEFAULT_TURN_DETECTION_CONFIG: dict[str, Any] = {
+    "type": "server_vad",
+    "silence_duration_ms": 500,
+    "threshold": 0.5,
+    "prefix_padding_ms": 300,
+}
+
+
+async def send_session_update(session: Any, turn_detection: dict[str, Any] | None) -> None:
+    """Enable or disable turn detection by sending a session.update raw message.
+
+    Args:
+        session: The active RealtimeSession.
+        turn_detection: The turn detection config dict, or None to disable.
+    """
+    await session.model.send_event(
+        RealtimeModelSendRawMessage(
+            message={
+                "type": "session.update",
+                "other_data": {
+                    "session": {
+                        "type": "realtime",
+                        "audio": {
+                            "input": {
+                                "turn_detection": turn_detection,
+                            },
+                        },
+                    },
+                },
+            },
+        ),
+    )
+
+
+async def send_response_create(session: Any, instructions: str) -> None:
+    """Send a response.create event to trigger speech generation.
+
+    Args:
+        session: The active RealtimeSession.
+        instructions: The instructions for what the model should say.
+    """
+    await session.model.send_event(
+        RealtimeModelSendRawMessage(
+            message={
+                "type": "response.create",
+                "other_data": {
+                    "response": {
+                        "instructions": instructions,
+                    },
+                },
+            },
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# First Response Manager (self-contained, from first_response.py logic)
+# ---------------------------------------------------------------------------
+class FirstResponseHandler:
+    """Manages the first bot response including consent and greeting flows.
+
+    Handles:
+    - Consent message delivery with turn detection toggling
+    - Listening for consent completion events
+    - Initiating the greeting after consent (or directly if no consent is configured)
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        consent_message: str | None,
+        greeting_message: str,
+        call_logger: logging.Logger,
+    ) -> None:
+        self._session = session
+        self._consent_message = consent_message
+        self._greeting_message = greeting_message
+        self._logger = call_logger
+        self._consent_initiated: bool = False
+        self._first_response_complete: bool = False
+
+    async def handle_event(self, event: Any) -> None:
+        """Event handler that restores turn detection after consent response completes."""
+        if self._consent_initiated:
+            return
+
+        # Check for consent completion events (voice or text channel)
+        if not (
+            isinstance(event, RealtimeRawModelEvent)
+            and isinstance(event.data, RealtimeModelRawServerEvent)
+            and event.data.data.get("type") in ("output_audio_buffer.stopped", "response.output_text.done")
+        ):
+            return
+
+        # Re-enable turn detection after consent message is spoken
+        self._logger.info("Consent response completed - re-enabling turn detection and initiating greeting.")
+        await send_session_update(self._session, DEFAULT_TURN_DETECTION_CONFIG)
+        self._consent_initiated = True
+        await self._initiate_greeting()
+
+    async def _initiate_greeting(self) -> None:
+        """Send the greeting message."""
+        await send_response_create(
+            self._session,
+            instructions=(
+                f"Say exactly the following greeting only once: {self._greeting_message}. "
+                f"If you were interrupted while saying it, do NOT repeat it. "
+                f"Proceed to the next step instead."
+            ),
+        )
+
+    async def trigger_first_response(self) -> None:
+        """Trigger the first bot response by delivering the consent message or greeting directly."""
+        if self._consent_message:
+            # Disable turn detection during consent so user cannot interrupt
+            self._logger.info("Disabling turn detection for consent message delivery.")
+            await send_session_update(self._session, None)
+
+            # Deliver the consent/disclosure message
+            await send_response_create(
+                self._session,
+                instructions=(
+                    f'Say exactly the following disclosure, word for word, with nothing else added: '
+                    f'"{self._consent_message}"'
+                ),
+            )
+        else:
+            # No consent message - initiate greeting directly
+            self._logger.info("No consent message configured - initiating greeting directly.")
+            await self._initiate_greeting()
+            self._first_response_complete = True
+
+    @property
+    def needs_event_handling(self) -> bool:
+        """Returns True if we need to listen for consent completion events."""
+        return bool(self._consent_message) and not self._consent_initiated
 
 
 async def accept_call(call_id: str) -> None:
@@ -103,10 +252,7 @@ async def observe_call(call_id: str) -> None:
 
     try:
         initial_model_settings: RealtimeSessionModelSettings = {
-            "turn_detection": {
-                "type": "semantic_vad",
-                "interrupt_response": True,
-            }
+            "turn_detection": DEFAULT_TURN_DETECTION_CONFIG,
         }
         async with await runner.run(
             model_config={
@@ -114,28 +260,22 @@ async def observe_call(call_id: str) -> None:
                 "initial_model_settings": initial_model_settings,
             }
         ) as session:
-            # Trigger an initial greeting so callers hear the agent right away.
-            # Issue a response.create immediately after the WebSocket attaches so the model speaks
-            # before the caller says anything. Using the raw client message ensures zero latency
-            # and avoids threading the greeting through history.
-            await session.model.send_event(
-                RealtimeModelSendRawMessage(
-                    message={
-                        "type": "response.create",
-                        "other_data": {
-                            "response": {
-                                "instructions": (
-                                    "Say exactly '"
-                                    f"{WELCOME_MESSAGE}"
-                                    "' now before continuing the conversation."
-                                )
-                            }
-                        },
-                    }
-                )
+            # Initialize the first response handler for consent/greeting flow
+            first_response_handler = FirstResponseHandler(
+                session=session,
+                consent_message=CONSENT_MESSAGE,
+                greeting_message=GREETING_MESSAGE,
+                call_logger=logger,
             )
 
+            # Trigger the first response (consent or greeting)
+            await first_response_handler.trigger_first_response()
+
             async for event in session:
+                # Handle consent completion if needed (re-enables turn detection and triggers greeting)
+                if first_response_handler.needs_event_handling:
+                    await first_response_handler.handle_event(event)
+
                 if event.type == "history_added":
                     item = event.item
                     if isinstance(item, UserMessageItem):
